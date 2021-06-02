@@ -1,0 +1,452 @@
+---
+title: "Bionformatics Resources Project"
+author: "Matteo Pozzi, Sara Vettorazzo"
+date: "26-06-2020"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+# Analysis of breast cancer data
+
+To perform our project we choose the dataset containing data from breast cancer that are extracted from TCGA cancer datasets.
+From the original data, only 50 tumors samples and 50 controls were selected.
+```{r}
+setwd("/home/matteo/Documents/universita/bioInfo_resources/Project")
+load("./Breast_Cancer.RData")
+
+```
+
+loading the RData we obtain three dataframes:\
+1) raw_counts_df = raw RNA-seq counts\
+2) c_anno_df = sample name and condition\
+3) r_anno_df = ENSEMBL gene ids, lenght of the genes and the genes symbols
+
+
+```{r}
+dim(raw_counts_df) #57992 genes and 100 samples --> table of read counts, with rows corresponding to genes and columns to independent libraries. The counts represent the total number of reads aligning to each gene
+
+dim(c_anno_df) # 100 samples and 2 variables (actually 1: the condition control-case)
+dim(r_anno_df) #57992 genes and 3 variables (2 actually: lenght and symbol)
+
+```
+
+#Point 3: Update raw_count_df and r_anno_df extracting only protein coding genes.
+
+```{r}
+library(biomaRt)
+
+database <- useMart('ENSEMBL_MART_ENSEMBL')
+datasetHuman <- useDataset("hsapiens_gene_ensembl", mart = database)
+
+query <- getBM(attributes=c("ensembl_gene_id",
+                            "external_gene_name",
+                            "gene_biotype",
+                            "transcript_count",
+                            "start_position",
+                            "end_position",
+                            "chromosome_name",
+                            "strand"),
+               filters = c("ensembl_gene_id"),
+               values = r_anno_df$gene_id,
+               mart = datasetHuman)
+
+sort(table(query$gene_biotype),decreasing=T) #from here we can see we have a lot of gene biotype, among them: 19662 protein_coding genes
+dim(r_anno_df)[1] #57992
+r_anno_df<-merge(r_anno_df,query,by.x = "gene_id", by.y = "ensembl_gene_id")
+r_anno_df <- r_anno_df[r_anno_df$gene_biotype == "protein_coding",]
+dim(r_anno_df)[1] #19662 protein coding genes
+
+dim(raw_counts_df)[1] #57992 
+raw_counts_df <- raw_counts_df[rownames(raw_counts_df) %in% r_anno_df$gene_id,]
+dim(raw_counts_df)[1] #19662
+
+#head(raw_counts_df)
+#head(r_anno_df)
+```
+By extracting only protein coding genes, our update data frames now count around 20000 genes. Now we can continue our analysis using such new data frames.
+
+#Point 4: Perform differential expression analysis using edgeR package.
+
+```{r}
+library(ggplot2)
+#library(biomaRt)
+library(edgeR)
+library(tidyverse)
+library(GenomicFeatures)
+library(stringr)
+
+#We filter raw counts data retaining only genes with a raw count >20
+#in at least 1 Case and 1 Control sample
+count_thr <- 20
+repl_thr <- 1
+
+filter_vec <- apply(raw_counts_df,1,function(y) max(by(y, c_anno_df$condition, function(x) sum(x>=count_thr))))
+filter_counts_df <- raw_counts_df[filter_vec>=repl_thr,]
+dim(filter_counts_df)[1] #now we filtered 18123 from the starting 19662
+
+#The filter is applied now on gene annotations
+filter_anno_df <- r_anno_df[which(r_anno_df$gene_id %in% rownames(filter_counts_df)),]
+dim(filter_anno_df)[1] #18123 
+
+#Now we check the library size of each sample (how many reads we have sequenced for each experiment)
+size_df <- data.frame("sample"=colnames(filter_counts_df), "read_millions"=colSums(filter_counts_df)/1000000) 
+
+ggplot(data=size_df,aes(sample,read_millions)) +
+  geom_bar(stat="identity",fill="indianred",colour="indianred",width=0.7,alpha=0.7)+
+  coord_flip()+
+  theme_bw()
+
+```
+```{r}
+#Now we visualize a boxplot of gene counts
+long_counts_df <- gather(filter_counts_df, key = "sample", value = "read_number")
+ggplot(data=long_counts_df,aes(sample,read_number+1)) + 
+  geom_boxplot(colour="deeppink4",fill="deeppink4",alpha=0.7) +
+  theme_bw() +
+  scale_y_log10()
+```
+
+As we can see from the plots, there is a big variability across samples in term of library sizes (reads per million). We have to take into account this aspect because the expected size of each count is the product of the relative abundance of that gene in that sample but also of the library size! 
+As we can see from the boxplot, we need to normalize our data before testing for differential expression. Normalization can be obtained using different methodologies. Among them, TMM (the default method) is a method that consider in the normalization also variables related to the library size. 
+
+```{r}
+#First of all we have to create our DGElist, a simple list-based data object in which edgeR stores data 
+edge_c <- DGEList(counts=filter_counts_df,group=c_anno_df$condition,samples=c_anno_df,genes=filter_anno_df) 
+
+#such object contains information about counts, samples and genes
+
+#Then we use the calcNormFactors function, that normalizes the library sizes by finding a set of scaling factors 
+edge_n <- calcNormFactors(edge_c,method="TMM") 
+
+#Now we want to display the normalization factors and have a look at the range (seeing the min and the max of normalizing factors used)
+norm_factors <- mean(edge_n$samples$lib.size*edge_n$samples$norm.factors)/(edge_n$samples$lib.size*edge_n$samples$norm.factors)
+names(norm_factors) <- edge_n$samples$sample
+head(norm_factors)
+min(norm_factors)   #0.6015
+max(norm_factors)   #2.4259
+
+#Now wa want to create a CPM_table, with the normlized expression values for each transcript expressed as counts per million (CPM)
+cpm_table <- as.data.frame(round(cpm(edge_n),2))
+#head(cpm_table)
+
+```
+
+```{r}
+#To see the effect of the normalization, we can have a look again at the boxplot distribution of gene expression signals after normalization
+long_cpm_df <- gather(cpm_table, key = "sample", value = "CPM") 
+
+ggplot(data=long_cpm_df,aes(sample,CPM+1)) + #per evitare gli zero
+  geom_boxplot(colour="deepskyblue4",fill="deepskyblue4",alpha=0.7)+
+  theme_bw()+
+  scale_y_log10()
+```
+
+With respect to the previous boxplot, we can see that after normalization the distributions are comparable. Our data are now ready to be tested for DE analysis.
+
+```{r}
+#First of all we need to define our design matrix based on the experimental design (we have to define which conditions we want to test --> case vs control)
+design <- model.matrix(~0+group, data=edge_c$samples)
+colnames(design) <- levels(edge_c$samples$group)
+rownames(design) <- edge_c$samples$sample
+head(design) #we see 1 in the column related to the sample condition, 0 in the other ones
+```
+
+Once we have the normalized data and the design, we can go on with the DE analysis calculating the dispersion fit.
+Actually, the basic principle of edgeR is that the over dispersion of counts across the samples can be modeled as a Poisson distribution, which can be approximated using a negative binomial distribution.  
+
+```{r}
+#Now we have to calculate the dispersion fit 
+edge_d <- estimateDisp(edge_n,design) #estimation of the global dispersion
+edge_f <- glmQLFit(edge_d,design) #fitting the dispersion in the neg. binomial 
+#Now dispersion estimates are obtained and the negative binomial generalized linear models are fitted.
+
+#glmQLFit returns an object containing the estimated values of the GLM coefficients for each gene:
+head(edge_f$coefficients)
+
+```
+
+Now we define the function edgeRglmQLF which test the differential expression in each gene using the information retrieved by the fit and using a quasi-likelihood F-test (QLF).
+
+```{r}
+#NB - with respect to the function provided during the lab lessons, we just changed the >=/<= with >/< (we want |logFC| > 1.5 and logCPM > 1)
+
+edgeRglmQLF <- function(mat=edge_f,contro,cpm_mat=edge_n,label="",sig_thr=0.5,sig_col="CPM",fc_thr=0.5,pval_col="p_val",pval_thr=0.05,names=FALSE)
+{
+   degs <- glmQLFTest(edge_f,contrast=contro)$table[,-3]
+   colnames(degs) <- c("log2_FC","log2_CPM","p_val")
+   a_levels <- rownames(contro)[which(contro!=0)]
+   a_samples <- which(cpm_mat$samples$group%in%a_levels)
+   cpm_sele <- cpm(cpm_mat,log=T)[,a_samples]
+   degs$log2_CPM <- apply(cpm_sele,1,function(x) mean(x))
+   #degs<-exactTest(edge_c, pair=cond, dispersion=bcv^2)$table
+   degs$p_adj <- p.adjust(degs$p_val, method ="BH")
+   degs$class <- "="
+   degs[which(degs[,sig_col]>sig_thr & degs$log2_FC>fc_thr & degs[,pval_col]<pval_thr),"class"] <- "+"
+   degs[which(degs[,sig_col]>sig_thr & degs$log2_FC<(-fc_thr) & degs[,pval_col]<pval_thr),"class"] <- "-"
+   degs$class <- as.factor(degs$class)
+   degs$comp <- label
+   degs$id <- rownames(degs)
+   degs <- degs[,c("id","comp","log2_FC","log2_CPM","p_val","p_adj","class")]
+   if(names=="TRUE"){
+      newnames <- paste(label,colnames(degs),sep="_")
+      colnames(degs) <- newnames
+   }
+   return(degs)
+}
+
+#then we have to define our contrast of interest --> conditions to be compared (Control and Case) 
+contro <- makeContrasts("Case-Control", levels=design)
+
+#now we apply the function in order to test for differentially expressed genes and we select our threshold of interest:
+# p-value cutoff (pval_thr) of 0.01
+# log fold change ratio (fc_thr) of 1.5 
+# log2 CPM (sig_thr) >1
+DEGs <- edgeRglmQLF(mat=edge_f, cpm_mat=edge_n, contro=contro, label="caseVScontrol", sig_thr=1, sig_col="log2_CPM", fc_thr=1.5, pval_thr=0.01, pval_col="p_adj",names=F)
+
+#Now we can see how many up and down regulated genes we have found
+summary(DEGs$class) #1019- 809+  16295 not significant (in total 18123)
+
+#We can now look at our DEGs sorting them for adj-pvalue. 
+head(DEGs[order(DEGs$p_adj),], n = 5)
+#we can see that the lowest p_adj p-value is extremely low (e-42)!
+
+```
+```{r}
+#Now we want to display a Volcano plot of the results
+input_df <- DEGs
+xlabel <- "Log2 FC Case VS Control"
+ylabel <- "-log10 adj_pvalue"
+
+par(fig=c(0,1,0,1), mar=c(4,4,1,2), mgp=c(2, 0.75, 0))	
+plot(input_df$log2_FC, -log(input_df$p_adj,base=10),xlab=xlabel, ylab=ylabel, 
+     col=ifelse(input_df$class=="=","grey70","red2"), pch=20, frame.plot=TRUE, cex=0.8, main="Volcano plot")
+abline(v=0,lty=2,col="grey20")
+```
+
+The volcano plot allows to have a quick visual identification of genes with large fold changes that are also statistically significant. Since the -log10 adj pavlaue are really high, we are not seeing red plot only on the top part of the plot. 
+
+
+```{r}
+#Finally we want to create an annotated heatmap focusing only on up- and down- regulated genes
+
+#To create an annotated heatmap focusing only on up- and down-regulated genes we need first of all a matrix in which we select genes with class "+" or "-"
+DEG_tot <- as.matrix(cpm_table[which(rownames(cpm_table)%in%DEGs$id[which(DEGs$class!="=")]),])
+
+#however we also need to have an order in samples: we need two groups: the 50 control on the left and the 50 case on the right
+#in this way we can then set the "ColSideColors" parameter in order to have a color code to recognize the sample condition... SO:
+control <- as.vector(c_anno_df[which(c_anno_df$condition == "Control"),]$sample)
+case <- as.vector(c_anno_df[which(c_anno_df$condition == "Case"),]$sample)
+control_matrx <- DEG_tot[,colnames(DEG_tot) %in% control]
+case_matrx <- DEG_tot[,colnames(DEG_tot) %in% case]
+DEG_m <- cbind(control_matrx,case_matrx)
+
+#Now we can plot our heatmap
+cols <- c(rep("deeppink",50),rep("cyan3",50)) 
+pal <- c("blue","white","red") 
+pal <- colorRampPalette(pal)(100)
+heatmap(DEG_m, ColSideColors = cols, cexCol = 0.5,margins = c(4,4),col=pal,cexRow = 0.2)
+```
+
+On the top we can see the dendrogram related to how distant our samples are, while on the left the dendrogrm related to genes.From this heatmap we can appreciate a pattern of up-regulated and down-regulated genes across the two different conditions of samples (case and control), in which we can notice an opposite behaviour.
+
+
+#Point 5: Gene set enrichment analysis: perform both GO (BP and MF) and KEGG analysis using clusterProfiler package.
+
+```{r}
+library(fgsea)
+library(org.Hs.eg.db)
+#library(biomaRt)
+library(clusterProfiler)
+library(DOSE)
+library(pathview)
+
+
+#Now we can use biomaRt to map Entrez IDs, Ensembl gene IDs and gene symbols (that we will need after during the enrichemnt analysis)
+convert <- getBM(attributes=c("ensembl_gene_id","entrezgene_id","external_gene_name"),
+                 filters=c("ensembl_gene_id"), 
+                 values=DEGs$id,
+                 mart = datasetHuman)
+
+DEGs <- merge(DEGs,convert,by.x="id",by.y="ensembl_gene_id")
+dim(DEGs)[1] #18227
+
+#Since after having performed the mapping, not all the ensemble ID have corresponding Entrex ID we need to clean our results: 
+DEGs <- DEGs[which(!is.na(DEGs$entrezgene_id)),]
+dim(DEGs)[1] #17779   (so we removed 448 genes with a NA entrez gene ID)
+
+#We may also have different ensemble gene id mapped to the same enrezgene id and we can remove such duplicates:
+DEGs <- DEGs[-which(duplicated(DEGs$entrezgene_id)),] 
+dim(DEGs)#17727    (we removed 52 genes)
+
+#We can have a look at the current situation of up and down regulated genes after having lost some of them
+table(DEGs$class)
+
+#Now we want to extract up and down DE gene lists
+upDEGs <- DEGs %>% filter(class == "+") 
+downDEGs <- DEGs %>% filter(class == "-") 
+
+
+#GENE ONTOLOGY ANALYSIS
+#Let's start with the Biological Process (BP) analysis
+ego_BP_up <- enrichGO(gene = upDEGs$external_gene_name,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP", 
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+ego_BP_down <- enrichGO(gene = downDEGs$external_gene_name,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP", 
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+#Now we report the top 10 enriched GO terms related to BP:
+barplot(ego_BP_up,showCategory=10, main = "Up-regulated gene list: top 10 enriched BP terms")
+barplot(ego_BP_down,showCategory=10, main= "Down-regulated gene list: top 10 enriched BP terms")
+
+```
+
+In the barplots we can see that the elements are ordered by adjusted p-value (where the most significant is placed on the top) and on the x-axis we have the gene counts, so the number of elements of our lists were found in the category.
+
+```{r}
+#We can also construct an enrichment map and visualize the gene-set overlap as a network. 
+emapplot(ego_BP_up,showCategory = 10)
+
+#Let's visualize the top 15
+emapplot(ego_BP_up,showCategory = 15)
+```
+From this graph we can see the connection between the top 10 enriched terms. Each node has a specific size (related to the size of the gene-set), a color related to the adjusted p-value and can be connected to other nodes if there is an overlap. We can notice the community which collect different elements related to chromosome segregation, mitosis and cell cycle.
+
+
+
+
+```{r}
+#Let's do the same for the Molecular Function (MF) 
+ego_MF_up <- enrichGO(gene = upDEGs$external_gene_name,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "MF", 
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+ego_MF_down <- enrichGO(gene = downDEGs$external_gene_name,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "MF", 
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+#Now we report the top 10 enriched GO terms related to BP:
+barplot(ego_MF_up,showCategory=10, main = "Up-regulated gene list: top 10 enriched MF terms")
+barplot(ego_MF_down,showCategory=10, main = "Down-regulated gene list: top 10 enriched MF terms")
+
+```
+```{r}
+#KEGG PATHWAYS ANALYSIS
+ekegg_up <- enrichKEGG(gene = upDEGs$entrezgene_id,
+                    organism = 'human',
+                    pvalueCutoff = 0.05,
+                    qvalueCutoff = 0.05)
+
+ekegg_down <- enrichKEGG(gene = downDEGs$entrezgene_id,
+                    organism = 'human',
+                    pvalueCutoff = 0.05,
+                    qvalueCutoff = 0.05)
+
+#We now report the top 10 enriched KEGG pathways resulting from both up- and down-regulated gene lists
+head(ekegg_up, n=10)
+head(ekegg_down, n=10)
+```
+
+
+
+
+#Point 6: Use the pathview R package to visualize one pathway you findenriched using the up-regulated gene list
+```{r}
+
+#We chose "hsa04110", the first one of up-regulated, related to 	cell cycle 
+logFC <- upDEGs$log2_FC
+names(logFC) <- upDEGs$entrezgene_id
+pathview(gene.data = logFC, 
+         pathway.id = "hsa04110", 
+         species = "human")
+
+#Then we visualized "hsa04510", the first one of down-regulated, related to focal adhesion
+logFC1 <- downDEGs$log2_FC
+names(logFC1) <- downDEGs$entrezgene_id
+pathview(gene.data = logFC1, 
+         pathway.id = "hsa04510",
+         species = "human")
+```
+
+
+#Point 7:  Identify which transcription factors (TFs) are enriched in the promoters of all up-regulated genes.
+
+```{r}
+#library(biomaRt)
+library(MotifDb)
+library(seqLogo)
+library(PWMEnrich)
+library(PWMEnrich.Hsapiens.background)
+
+promoter_seq <- getSequence(id = upDEGs$id, 
+                            type="ensembl_gene_id",
+                            seqType="gene_flank",
+                            upstream=500,
+                            mart=datasetHuman)
+
+#We now load the motif db data with all the reference distribution we need to perform the enrichment
+data(PWMLogn.hg19.MotifDb.Hsap)
+
+#To use the motifEnrichment function we need to first create a list of DNA strings 
+sequences <- lapply(promoter_seq$gene_flank,function(x) DNAString(x))
+
+#Now we can perform the motif enrichment
+enriched_TFs <- motifEnrichment(sequences,PWMLogn.hg19.MotifDb.Hsap,score = "affinity")
+#report <- groupReport(enriched_TFs)  #find the most enriched TF across the whole set of sequences
+report <- sequenceReport(enriched_TFs, 1) #generate a motif enrichment report for a single sequence
+report
+plot(report[1:10], fontsize=7, id.fontsize=6)#first 10 
+```
+
+#Point 8 and 9: Empirical distribution for the motif and pattern matching
+Select one among the top enriched TFs, compute the empirical distributions of scores for all PWMs that you find in MotifDB and determine for all of them the distribution (log2) threshold cutoff at 99.5%. Identify which up-regulated genes have a region in their promoter with binding scores above the computed
+thresholds for any of the previously selected PWMs.
+
+```{r}
+#we choose "KCNIP1" which has the lowest p-value
+
+tfs <- report$target[3] 
+tfs_motifs = subset(MotifDb, organism=='Hsapiens' & geneSymbol==tfs) #twelve for the selected transcription factor
+
+#transformation to a PWM matrix
+PWM = toPWM(as.list(tfs_motifs))
+
+#we calculate the empirical distribution for the motif (from which we can define some treshold --> in this case we want a treshold of 0.995)
+ecdf = motifEcdf(PWM,organism = "hg19",quick=TRUE)
+thresholds = lapply(ecdf,function(x) quantile(x,0.995))
+
+#Now we want to perform pattern matching navigating along all the sequences and end up with a distribution of scores, from which discriminate the potential binding site for our TF above the computed treshold.
+scores = motifScores(sequences,PWM,raw.score=FALSE,cutoff=unlist(thresholds)) #tot amount of scores that passes the score for each specific PWM
+
+
+genes_positions <- which(apply(scores,1,function(x){sum(x==0)})==0)
+genes_id <- promoter_seq$ensembl_gene_id[genes_positions]
+genes_id #this are the up-regulated genes that has a region in their promoter with binding scores above the defined treshold for any PWMs
+
+```
+
+
+
+
+
+
+
