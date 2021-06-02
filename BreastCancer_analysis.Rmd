@@ -1,6 +1,6 @@
 ---
 title: "Bionformatics Resources Project"
-author: "Matteo Pozzi, Sara Vettorazzo"
+author: "Matteo Pozzi"
 date: "26-06-2020"
 output:
   pdf_document: default
